@@ -1,0 +1,158 @@
+name: Check Upstream HA Releases
+
+on:
+  schedule:
+    # Poll every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Trigger build even if no upstream change detected"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    name: Poll upstream HA repos for new releases
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout baos-build
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BAOS_BUILD_TOKEN }}
+
+      - name: Fetch latest upstream versions
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          fetch_latest() {
+            local repo="$1"
+            local tag
+            tag=$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+            echo "$tag"
+          }
+
+          # home-assistant/operating-system uses plain version tags (e.g. 17.2)
+          HAOS=$(fetch_latest "home-assistant/operating-system")
+          CORE=$(fetch_latest "home-assistant/core")
+          SUPERVISOR=$(fetch_latest "home-assistant/supervisor")
+          FRONTEND=$(fetch_latest "home-assistant/frontend")
+
+          # iOS uses release/YYYY.M/build — extract the semver-ish part
+          IOS_RAW=$(gh api "repos/home-assistant/iOS/releases/latest" --jq '.name' 2>/dev/null || echo "")
+          IOS=$(echo "$IOS_RAW" | grep -oP '^\d+\.\d+\.\d+' || echo "$IOS_RAW")
+
+          ANDROID=$(fetch_latest "home-assistant/android")
+
+          echo "haos=${HAOS}"         >> "$GITHUB_OUTPUT"
+          echo "core=${CORE}"         >> "$GITHUB_OUTPUT"
+          echo "supervisor=${SUPERVISOR}" >> "$GITHUB_OUTPUT"
+          echo "frontend=${FRONTEND}" >> "$GITHUB_OUTPUT"
+          echo "ios=${IOS}"           >> "$GITHUB_OUTPUT"
+          echo "android=${ANDROID}"   >> "$GITHUB_OUTPUT"
+
+      - name: Compare with pinned versions
+        id: diff
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(cat upstream-versions.json)
+
+          PINNED_HAOS=$(echo "$CURRENT"       | jq -r '.haos')
+          PINNED_CORE=$(echo "$CURRENT"       | jq -r '.core')
+          PINNED_SUP=$(echo "$CURRENT"        | jq -r '.supervisor')
+          PINNED_FRONT=$(echo "$CURRENT"      | jq -r '.frontend')
+          PINNED_IOS=$(echo "$CURRENT"        | jq -r '.ios')
+          PINNED_ANDROID=$(echo "$CURRENT"    | jq -r '.android')
+
+          CHANGED_COMPONENTS=""
+
+          check() {
+            local name="$1" pinned="$2" fetched="$3"
+            if [[ -n "$fetched" && "$pinned" != "$fetched" ]]; then
+              echo "  $name: $pinned → $fetched"
+              CHANGED_COMPONENTS="${CHANGED_COMPONENTS}${name},"
+            fi
+          }
+
+          echo "Comparing versions:"
+          check "haos"       "$PINNED_HAOS"    "${{ steps.fetch.outputs.haos }}"
+          check "core"       "$PINNED_CORE"    "${{ steps.fetch.outputs.core }}"
+          check "supervisor" "$PINNED_SUP"     "${{ steps.fetch.outputs.supervisor }}"
+          check "frontend"   "$PINNED_FRONT"   "${{ steps.fetch.outputs.frontend }}"
+          check "ios"        "$PINNED_IOS"     "${{ steps.fetch.outputs.ios }}"
+          check "android"    "$PINNED_ANDROID" "${{ steps.fetch.outputs.android }}"
+
+          # Strip trailing comma
+          CHANGED_COMPONENTS="${CHANGED_COMPONENTS%,}"
+
+          if [[ -n "$CHANGED_COMPONENTS" || "${{ inputs.force_build }}" == "true" ]]; then
+            echo "changed=true"   >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false"  >> "$GITHUB_OUTPUT"
+            echo "No upstream changes detected."
+          fi
+
+          echo "components=${CHANGED_COMPONENTS}" >> "$GITHUB_OUTPUT"
+
+      - name: Update upstream-versions.json
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+
+          jq \
+            --arg haos       "${{ steps.fetch.outputs.haos }}" \
+            --arg core       "${{ steps.fetch.outputs.core }}" \
+            --arg supervisor "${{ steps.fetch.outputs.supervisor }}" \
+            --arg frontend   "${{ steps.fetch.outputs.frontend }}" \
+            --arg ios        "${{ steps.fetch.outputs.ios }}" \
+            --arg android    "${{ steps.fetch.outputs.android }}" \
+            '{
+              haos:       $haos,
+              core:       $core,
+              supervisor: $supervisor,
+              frontend:   $frontend,
+              ios:        $ios,
+              android:    $android
+            }' \
+            upstream-versions.json > upstream-versions.json.new
+          mv upstream-versions.json.new upstream-versions.json
+
+      - name: Commit updated versions
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name  "baos-bot"
+          git config user.email "baos-bot@users.noreply.github.com"
+          git add upstream-versions.json
+          git commit -m "chore: bump upstream versions [${{ steps.diff.outputs.components }}]"
+          git push
+
+      - name: Dispatch build
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.BAOS_BUILD_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo:  "baos-build",
+              event_type: "upstream-update",
+              client_payload: {
+                components: "${{ steps.diff.outputs.components }}",
+                haos:       "${{ steps.fetch.outputs.haos }}",
+                core:       "${{ steps.fetch.outputs.core }}",
+                supervisor: "${{ steps.fetch.outputs.supervisor }}",
+                frontend:   "${{ steps.fetch.outputs.frontend }}",
+                ios:        "${{ steps.fetch.outputs.ios }}",
+                android:    "${{ steps.fetch.outputs.android }}"
+              }
+            });
+            console.log("Build dispatch sent for components: ${{ steps.diff.outputs.components }}");
