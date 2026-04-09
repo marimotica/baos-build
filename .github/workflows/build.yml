@@ -26,6 +26,10 @@ on:
         description: "Reason for manual build"
         required: false
         default: "manual"
+      os_ref:
+        description: "ba-operating-system ref to build from (default: baos-main)"
+        required: false
+        default: "baos-main"
 
 permissions:
   contents: write
@@ -34,6 +38,7 @@ permissions:
 env:
   BAOS_BUILD_REPO: marimotica/baos-build
   BAOS_OS_REPO:   marimotica/ba-operating-system
+  BAOS_OS_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.os_ref || 'baos-main' }}
   PYTHON_VERSION: "3.13"
 
 jobs:
@@ -61,7 +66,7 @@ jobs:
         with:
           repository: ${{ env.BAOS_OS_REPO }}
           token: ${{ secrets.BAOS_BUILD_TOKEN }}
-          ref: baos-main
+          ref: ${{ env.BAOS_OS_REF }}
 
       - name: Read pinned upstream versions from baos-build
         id: versions
@@ -94,6 +99,7 @@ jobs:
           echo "| HAOS base | ${HAOS} |"       >> "$GITHUB_STEP_SUMMARY"
           echo "| HA Core   | ${CORE} |"       >> "$GITHUB_STEP_SUMMARY"
           echo "| BAOS      | ${BAOS} |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "| OS ref    | ${{ env.BAOS_OS_REF }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Triggered by | ${TRIGGER} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate development version suffix
@@ -186,7 +192,7 @@ jobs:
           repository: ${{ env.BAOS_OS_REPO }}
           token: ${{ secrets.BAOS_BUILD_TOKEN }}
           fetch-depth: 0
-          ref: baos-main
+          ref: ${{ env.BAOS_OS_REF }}
 
       - name: Add upstream remote and fetch tag
         run: |
@@ -204,7 +210,7 @@ jobs:
           fi
 
       - name: Merge upstream tag into baos-main
-        if: steps.check_merge.outputs.already_merged == 'false'
+        if: steps.check_merge.outputs.already_merged == 'false' && env.BAOS_OS_REF == 'baos-main'
         run: |
           git config user.name  "baos-bot"
           git config user.email "baos-bot@users.noreply.github.com"
@@ -212,6 +218,11 @@ jobs:
             --no-ff \
             -m "merge: HAOS ${{ needs.prepare.outputs.haos_version }} into baos-main"
           git push origin baos-main
+
+      - name: Skip upstream merge for custom OS ref
+        if: steps.check_merge.outputs.already_merged == 'false' && env.BAOS_OS_REF != 'baos-main'
+        run: |
+          echo "Using custom ba-operating-system ref ${{ env.BAOS_OS_REF }}; skipping upstream auto-merge."
 
   # -----------------------------------------------------------------------
   # 3. Build BAOS OS images via Docker (mirrors upstream HAOS CI exactly)
@@ -235,7 +246,7 @@ jobs:
         with:
           repository: ${{ env.BAOS_OS_REPO }}
           token: ${{ secrets.BAOS_BUILD_TOKEN }}
-          ref: baos-main
+          ref: ${{ env.BAOS_OS_REF }}
           submodules: true
 
       - name: Set version suffix
@@ -344,7 +355,7 @@ jobs:
         with:
           repository: ${{ env.BAOS_OS_REPO }}
           token: ${{ secrets.BAOS_BUILD_TOKEN }}
-          ref: baos-main
+          ref: ${{ env.BAOS_OS_REF }}
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
