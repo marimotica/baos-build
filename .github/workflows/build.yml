@@ -215,6 +215,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      packages: read
     needs:
       - prepare
       - sync-os-fork
