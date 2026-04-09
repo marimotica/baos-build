@@ -18,6 +18,10 @@ on:
   # Manual trigger
   workflow_dispatch:
     inputs:
+      boards:
+        description: "Boards to build (comma-separated IDs, empty = all)"
+        required: false
+        default: ""
       reason:
         description: "Reason for manual build"
         required: false
@@ -30,63 +34,147 @@ permissions:
 env:
   BAOS_BUILD_REPO: marimotica/baos-build
   BAOS_OS_REPO:   marimotica/ba-operating-system
+  PYTHON_VERSION: "3.13"
 
 jobs:
   # -----------------------------------------------------------------------
-  # 1. Resolve what we are building against
+  # 1. Prepare: resolve versions, build builder image, generate board matrix
   # -----------------------------------------------------------------------
-  resolve-versions:
-    name: Resolve build versions
-    runs-on: ubuntu-latest
+  prepare:
+    name: Prepare build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
     outputs:
-      haos_version:   ${{ steps.versions.outputs.haos }}
-      core_version:   ${{ steps.versions.outputs.core }}
-      baos_version:   ${{ steps.versions.outputs.baos }}
-      trigger_source: ${{ steps.versions.outputs.trigger_source }}
+      haos_version:          ${{ steps.versions.outputs.haos }}
+      core_version:          ${{ steps.versions.outputs.core }}
+      baos_version:          ${{ steps.versions.outputs.baos }}
+      trigger_source:        ${{ steps.versions.outputs.trigger_source }}
+      version_dev:           ${{ steps.version_dev.outputs.version_dev }}
+      matrix:                ${{ steps.generate_matrix.outputs.result }}
+      build_container_image: ghcr.io/${{ github.repository_owner }}/haos-builder@${{ steps.build_haos_builder.outputs.digest }}
 
     steps:
-      - name: Checkout baos-build
+      - name: Checkout ba-operating-system
         uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BAOS_OS_REPO }}
+          token: ${{ secrets.BAOS_BUILD_TOKEN }}
+          ref: baos-main
 
-      - name: Read pinned upstream versions
+      - name: Read pinned upstream versions from baos-build
         id: versions
         run: |
           set -euo pipefail
-          HAOS=$(jq -r '.haos' upstream-versions.json)
-          CORE=$(jq -r '.core' upstream-versions.json)
+          # Fetch upstream-versions.json from baos-build repo
+          VERSIONS=$(curl -fsSL \
+            -H "Authorization: token ${{ secrets.BAOS_BUILD_TOKEN }}" \
+            "https://raw.githubusercontent.com/marimotica/baos-build/main/upstream-versions.json")
 
-          # BAOS version = HAOS base + build counter (date-based patch)
-          BAOS="${HAOS}+baos.$(date -u +%Y%m%d)"
+          HAOS=$(echo "$VERSIONS" | jq -r '.haos')
+          CORE=$(echo "$VERSIONS" | jq -r '.core')
 
-          # Determine what triggered this build
+          # BAOS version = HAOS base + date-based dev suffix
+          BAOS="${HAOS}+baos.$(date -u +%Y%m%d%H%M)"
+
           TRIGGER="${{ github.event_name }}"
           if [[ "$TRIGGER" == "repository_dispatch" ]]; then
             TRIGGER="${{ github.event.action }} (${{ github.event.client_payload.components || github.event.client_payload.component }})"
           fi
 
-          echo "haos=${HAOS}"           >> "$GITHUB_OUTPUT"
-          echo "core=${CORE}"           >> "$GITHUB_OUTPUT"
-          echo "baos=${BAOS}"           >> "$GITHUB_OUTPUT"
-          echo "trigger_source=${TRIGGER}" >> "$GITHUB_OUTPUT"
+          echo "haos=${HAOS}"                  >> "$GITHUB_OUTPUT"
+          echo "core=${CORE}"                  >> "$GITHUB_OUTPUT"
+          echo "baos=${BAOS}"                  >> "$GITHUB_OUTPUT"
+          echo "trigger_source=${TRIGGER}"     >> "$GITHUB_OUTPUT"
 
-          echo "### Build versions" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Component | Version |"  >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|"                 >> "$GITHUB_STEP_SUMMARY"
-          echo "| HAOS base | ${HAOS} |"  >> "$GITHUB_STEP_SUMMARY"
-          echo "| HA Core   | ${CORE} |"  >> "$GITHUB_STEP_SUMMARY"
-          echo "| BAOS      | ${BAOS} |"  >> "$GITHUB_STEP_SUMMARY"
+          echo "### Build versions"            >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | Version |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|"                      >> "$GITHUB_STEP_SUMMARY"
+          echo "| HAOS base | ${HAOS} |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "| HA Core   | ${CORE} |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "| BAOS      | ${BAOS} |"       >> "$GITHUB_STEP_SUMMARY"
           echo "| Triggered by | ${TRIGGER} |" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Generate development version suffix
+        id: version_dev
+        run: |
+          version_dev="dev$(date --utc +'%Y%m%d%H%M%S')"
+          echo "version_dev=${version_dev}" >> "$GITHUB_OUTPUT"
+
+      - name: Set version suffix in checkout
+        env:
+          VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
+        run: |
+          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+
+      - name: Create build matrix
+        uses: actions/github-script@v7
+        id: generate_matrix
+        with:
+          script: |
+            const boards = require('./.github/workflows/matrix.json')
+            const boardFilter = "${{ github.event.inputs.boards }}"
+            if (boardFilter == "") {
+              console.log("Building all boards")
+              return { "board": boards }
+            }
+            const boardSet = new Set(boardFilter.split(",").map(s => s.trim()))
+            const buildBoards = boards.filter(b => boardSet.has(b.id))
+            console.log("Building subset:", buildBoards.map(b => b.id))
+            return { "board": buildBoards }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push haos-builder image
+        uses: docker/build-push-action@v6
+        id: build_haos_builder
+        with:
+          context: .
+          file: Dockerfile
+          tags: ghcr.io/${{ github.repository_owner }}/haos-builder
+          cache-from: ghcr.io/${{ github.repository_owner }}/haos-builder:cache
+          cache-to:   ghcr.io/${{ github.repository_owner }}/haos-builder:cache
+          push: true
+
+      - name: Generate self-signed RAUC certificate (no secrets present)
+        id: generate_signing_key
+        env:
+          RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
+          RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
+        if: env.RAUC_CERTIFICATE == '' || env.RAUC_PRIVATE_KEY == ''
+        run: |
+          echo "::warning::RAUC certificate/key not found in secrets — building with self-signed cert."
+          buildroot-external/scripts/generate-signing-key.sh cert.pem key.pem
+          echo "self_signed_cert=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signing key artifact
+        uses: actions/upload-artifact@v4
+        if: steps.generate_signing_key.outcome == 'success'
+        with:
+          name: signing-key
+          path: |
+            cert.pem
+            key.pem
+
   # -----------------------------------------------------------------------
-  # 2. Sync the ba-operating-system fork with upstream + BAOS patches
+  # 2. Sync the ba-operating-system fork with upstream HAOS tag
   # -----------------------------------------------------------------------
   sync-os-fork:
-    name: Sync ba-operating-system with upstream HAOS
-    runs-on: ubuntu-latest
-    needs: resolve-versions
+    name: Sync ba-operating-system with upstream HAOS ${{ needs.prepare.outputs.haos_version }}
+    runs-on: ubuntu-22.04
+    needs: prepare
 
     steps:
-      - name: Checkout ba-operating-system (BAOS patches branch)
+      - name: Checkout ba-operating-system
         uses: actions/checkout@v4
         with:
           repository: ${{ env.BAOS_OS_REPO }}
@@ -97,53 +185,42 @@ jobs:
       - name: Add upstream remote and fetch tag
         run: |
           git remote add upstream https://github.com/home-assistant/operating-system.git || true
-          git fetch upstream tag "${{ needs.resolve-versions.outputs.haos_version }}" --no-tags
+          git fetch upstream tag "${{ needs.prepare.outputs.haos_version }}" --no-tags
 
-      - name: Check if upstream tag is already merged
+      - name: Check if upstream tag already merged
         id: check_merge
         run: |
           if git merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null; then
             echo "already_merged=true" >> "$GITHUB_OUTPUT"
-            echo "HAOS ${{ needs.resolve-versions.outputs.haos_version }} already in branch."
+            echo "HAOS ${{ needs.prepare.outputs.haos_version }} already in branch — skipping merge."
           else
             echo "already_merged=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Rebase BAOS patches on new upstream tag
+      - name: Merge upstream tag into baos-main
         if: steps.check_merge.outputs.already_merged == 'false'
         run: |
           git config user.name  "baos-bot"
           git config user.email "baos-bot@users.noreply.github.com"
-
-          # The branch structure:
-          #   upstream/<haos-version>  = upstream tag, no BAOS changes
-          #   baos-main                = BAOS patches rebased on latest upstream
-          #
-          # Strategy: merge upstream tag into baos-main (merge commit keeps history clean).
-          # Switch to rebase if you prefer a linear history.
           git merge FETCH_HEAD \
             --no-ff \
-            -m "merge: HAOS ${{ needs.resolve-versions.outputs.haos_version }} into baos-main"
-
+            -m "merge: HAOS ${{ needs.prepare.outputs.haos_version }} into baos-main"
           git push origin baos-main
 
   # -----------------------------------------------------------------------
-  # 3. Build BAOS OS images (Buildroot — requires self-hosted runner)
+  # 3. Build BAOS OS images via Docker (mirrors upstream HAOS CI exactly)
   # -----------------------------------------------------------------------
-  build-os:
-    name: Build BAOS OS image (${{ matrix.board }})
-    runs-on: self-hosted-baos-builder   # Register a self-hosted runner with this label
+  build:
+    name: Build for ${{ matrix.board.id }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     needs:
-      - resolve-versions
+      - prepare
       - sync-os-fork
     strategy:
       fail-fast: false
-      matrix:
-        board:
-          - generic-aarch64
-          - generic-x86-64
-          - rpi4          # Raspberry Pi 4 — likely BAOS primary target hardware
-          - rpi5
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout ba-operating-system
@@ -152,113 +229,129 @@ jobs:
           repository: ${{ env.BAOS_OS_REPO }}
           token: ${{ secrets.BAOS_BUILD_TOKEN }}
           ref: baos-main
-          submodules: recursive
+          submodules: true
 
-      - name: Set up build environment (Buildroot deps)
+      - name: Set version suffix
+        env:
+          VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential bc cpio rsync unzip sed bzip2 xz-utils \
-            python3 python3-jinja2 python3-pexpect file wget \
-            gcc g++ libssl-dev libelf-dev flex bison \
-            qemu-user-static
+          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
 
-      - name: Apply BAOS OS overlay
+      - name: Add release PKI certs
+        if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
+        env:
+          RAUC_CERTIFICATE: ${{ secrets.RAUC_CERTIFICATE }}
+          RAUC_PRIVATE_KEY: ${{ secrets.RAUC_PRIVATE_KEY }}
         run: |
-          # BAOS overlay lives in boards/baos/ inside the fork.
-          # It is applied via Buildroot's BR2_EXTERNAL mechanism.
-          echo "Applying BAOS overlay for ${{ matrix.board }}"
-          export BR2_EXTERNAL="$(pwd)/baos-overlay"
+          echo -e "-----BEGIN CERTIFICATE-----\n${RAUC_CERTIFICATE}\n-----END CERTIFICATE-----" > cert.pem
+          echo -e "-----BEGIN PRIVATE KEY-----\n${RAUC_PRIVATE_KEY}\n-----END PRIVATE KEY-----" > key.pem
 
-      - name: Configure build for ${{ matrix.board }}
-        run: |
-          make "baos_${{ matrix.board }}_defconfig"
-
-      - name: Build image
-        run: |
-          make -j"$(nproc)"
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p /tmp/baos-artifacts
-          cp output/images/haos_${{ matrix.board }}-*.img.xz   /tmp/baos-artifacts/ || true
-          cp output/images/haos_${{ matrix.board }}-*.raucb    /tmp/baos-artifacts/ || true
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: baos-images-${{ matrix.board }}
-          path: /tmp/baos-artifacts/
-          retention-days: 30
-
-  # -----------------------------------------------------------------------
-  # 4. Smoke test (boot in QEMU)
-  # -----------------------------------------------------------------------
-  test:
-    name: Smoke test (${{ matrix.board }})
-    runs-on: self-hosted-baos-builder
-    needs: build-os
-    strategy:
-      fail-fast: false
-      matrix:
-        board:
-          - generic-x86-64   # Only x86-64 is easily testable in QEMU
-
-    steps:
-      - name: Download image artifact
+      - name: Get self-signed certificate
+        if: ${{ needs.prepare.outputs.self_signed_cert == 'true' }}
         uses: actions/download-artifact@v4
         with:
-          name: baos-images-${{ matrix.board }}
-          path: /tmp/baos-test/
+          name: signing-key
 
-      - name: Checkout test scripts
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: tests/
-
-      - name: Run QEMU smoke test
+      - name: Free disk space and prepare mount points
         run: |
-          ./tests/qemu-smoke-test.sh \
-            "/tmp/baos-test/haos_${{ matrix.board }}-*.img.xz" \
-            "${{ needs.resolve-versions.outputs.baos_version }}"
+          df -h
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo mkdir /mnt/cache
+          sudo mkdir /mnt/output
+          WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
+          sudo ln -sf /mnt/output "${GITHUB_WORKSPACE}/output"
+          sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
+          sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
+          df -h
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/cache/cc
+          key: baos-cc-${{ matrix.board.id }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate build config
+        uses: "./.github/actions/haos-builder-command"
+        with:
+          image: ${{ needs.prepare.outputs.build_container_image }}
+          command: make ${{ matrix.board.defconfig }}_defconfig
+
+      - name: Build
+        uses: "./.github/actions/haos-builder-command"
+        with:
+          image: ${{ needs.prepare.outputs.build_container_image }}
+          command: make
+
+      - name: Check Linux config
+        uses: "./.github/actions/haos-builder-command"
+        with:
+          image: ${{ needs.prepare.outputs.build_container_image }}
+          command: |
+            make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
+
+      - name: Save compiler cache
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/cache/cc
+          key: baos-cc-${{ matrix.board.id }}-${{ github.run_id }}
+
+      - name: Upload OS image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: baos_${{ matrix.board.id }}-${{ needs.prepare.outputs.baos_version }}
+          path: |
+            output/images/haos_${{ matrix.board.id }}-*.img.xz
+            output/images/haos_${{ matrix.board.id }}-*.raucb
+          retention-days: 30
+
+      - name: Build summary
+        run: |
+          echo "## ${{ matrix.board.id }} build summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|:-|:-|" >> "$GITHUB_STEP_SUMMARY"
+          for f in output/images/haos_*; do
+            echo "| $(basename $f) | $(du -bh $f | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   # -----------------------------------------------------------------------
-  # 5. Publish GitHub Release with all images
+  # 4. Publish GitHub Release
   # -----------------------------------------------------------------------
   release:
-    name: Publish BAOS release
-    runs-on: ubuntu-latest
+    name: Publish BAOS ${{ needs.prepare.outputs.baos_version }}
+    runs-on: ubuntu-22.04
     needs:
-      - resolve-versions
-      - build-os
-      - test
+      - prepare
+      - build
 
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: baos-images-*
+          pattern: baos_*
           merge-multiple: true
           path: /tmp/baos-release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.resolve-versions.outputs.baos_version }}
-          name: "BAOS ${{ needs.resolve-versions.outputs.baos_version }}"
+          tag_name:   ${{ needs.prepare.outputs.baos_version }}
+          name:       "BAOS ${{ needs.prepare.outputs.baos_version }}"
+          repository: ${{ env.BAOS_BUILD_REPO }}
+          token:      ${{ secrets.BAOS_BUILD_TOKEN }}
           body: |
-            ## Boat Assistant OS ${{ needs.resolve-versions.outputs.baos_version }}
+            ## Boat Assistant OS ${{ needs.prepare.outputs.baos_version }}
 
-            Based on **Home Assistant OS ${{ needs.resolve-versions.outputs.haos_version }}**
-            with HA Core ${{ needs.resolve-versions.outputs.core_version }}.
-
-            ### What's included
-            - BAOS branding and marine UX
-            - CAN/SocketCAN kernel support
-            - Marine integrations preinstalled
-            - Helm dashboards
+            Based on **Home Assistant OS ${{ needs.prepare.outputs.haos_version }}**
+            with HA Core ${{ needs.prepare.outputs.core_version }}.
 
             ### Trigger
-            ${{ needs.resolve-versions.outputs.trigger_source }}
+            ${{ needs.prepare.outputs.trigger_source }}
           files: /tmp/baos-release/**
-          token: ${{ secrets.BAOS_BUILD_TOKEN }}
