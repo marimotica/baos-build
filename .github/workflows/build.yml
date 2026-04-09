@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       boards:
-        description: "Boards to build (comma-separated IDs, empty = all)"
+        description: "Boards to build: empty = rpi5-64+rpi4-64 (default), 'all' = all boards, or comma-separated IDs"
         required: false
         default: ""
       reason:
@@ -116,6 +116,12 @@ jobs:
             const boards = require('./.github/workflows/matrix.json')
             const boardFilter = "${{ github.event.inputs.boards }}"
             if (boardFilter == "") {
+              // Default: only build boards flagged as default (rpi5-64 and rpi4-64)
+              const defaultBoards = boards.filter(b => b.default === true)
+              console.log("Building default boards:", defaultBoards.map(b => b.id))
+              return { "board": defaultBoards }
+            }
+            if (boardFilter == "all") {
               console.log("Building all boards")
               return { "board": boards }
             }
@@ -333,6 +339,13 @@ jobs:
       - build
 
     steps:
+      - name: Checkout ba-operating-system (for composite actions)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BAOS_OS_REPO }}
+          token: ${{ secrets.BAOS_BUILD_TOKEN }}
+          ref: baos-main
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -341,6 +354,7 @@ jobs:
           path: /tmp/baos-release/
 
       - name: Create GitHub Release
+        id: create_release
         uses: softprops/action-gh-release@v2
         with:
           tag_name:   ${{ needs.prepare.outputs.baos_version }}
@@ -353,6 +367,21 @@ jobs:
             Based on **Home Assistant OS ${{ needs.prepare.outputs.haos_version }}**
             with HA Core ${{ needs.prepare.outputs.core_version }}.
 
+            ### Install via Raspberry Pi Imager
+            Open RPi Imager, choose **Other specific-purpose OS → Home automation → Boat Assistant**,
+            or use the direct download links below.
+
             ### Trigger
             ${{ needs.prepare.outputs.trigger_source }}
           files: /tmp/baos-release/**
+
+      - name: Get release timestamp
+        id: release_time
+        run: echo "iso=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Update RPi Imager JSON in ba-version
+        uses: "./.github/actions/bump-rpi-imager-version"
+        with:
+          version:      ${{ needs.prepare.outputs.baos_version }}
+          release-date: ${{ steps.release_time.outputs.iso }}
+          token:        ${{ secrets.BAOS_BUILD_TOKEN }}
