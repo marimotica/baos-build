@@ -100,7 +100,7 @@ jobs:
       - name: Generate development version suffix
         id: version_dev
         run: |
-          version_dev="dev$(date --utc +'%Y%m%d%H%M%S')"
+          version_dev="dev$(date --utc +'%Y%m%d')"
           echo "version_dev=${version_dev}" >> "$GITHUB_OUTPUT"
 
       - name: Set version suffix in checkout
@@ -316,8 +316,8 @@ jobs:
         with:
           name: baos_${{ matrix.board.id }}-${{ needs.prepare.outputs.baos_version }}
           path: |
-            output/images/haos_${{ matrix.board.id }}-*.img.xz
-            output/images/haos_${{ matrix.board.id }}-*.raucb
+            output/images/baos_${{ matrix.board.id }}-*.img.xz
+            output/images/baos_${{ matrix.board.id }}-*.raucb
           retention-days: 30
 
       - name: Build summary
@@ -325,7 +325,7 @@ jobs:
           echo "## ${{ matrix.board.id }} build summary" >> "$GITHUB_STEP_SUMMARY"
           echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-|:-|" >> "$GITHUB_STEP_SUMMARY"
-          for f in output/images/haos_*; do
+          for f in output/images/baos_*; do
             echo "| $(basename $f) | $(du -bh $f | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
           done
 
