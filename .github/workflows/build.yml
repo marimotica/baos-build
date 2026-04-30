@@ -107,7 +107,7 @@ jobs:
         env:
           VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
         run: |
-          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+          sed -i'' -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
 
       - name: Create build matrix
         uses: actions/github-script@v7
@@ -243,7 +243,7 @@ jobs:
         env:
           VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
         run: |
-          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+          sed -i'' -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
 
       - name: Add release PKI certs
         if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
