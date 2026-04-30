@@ -42,7 +42,7 @@ jobs:
   # -----------------------------------------------------------------------
   prepare:
     name: Prepare build
-    runs-on: ubuntu-22.04
+    runs-on: self-hosted-baos-builder
     permissions:
       contents: read
       packages: write
@@ -177,7 +177,7 @@ jobs:
   # -----------------------------------------------------------------------
   sync-os-fork:
     name: Sync ba-operating-system with upstream HAOS ${{ needs.prepare.outputs.haos_version }}
-    runs-on: ubuntu-22.04
+    runs-on: self-hosted-baos-builder
     needs: prepare
 
     steps:
@@ -219,7 +219,7 @@ jobs:
   # -----------------------------------------------------------------------
   build:
     name: Build for ${{ matrix.board.id }}
-    runs-on: ubuntu-22.04
+    runs-on: self-hosted-baos-builder
     permissions:
       contents: write
       packages: read
@@ -263,20 +263,19 @@ jobs:
       - name: Free disk space and prepare mount points
         run: |
           df -h
-          sudo rm -rf /usr/local/lib/android/sdk/ndk
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo mkdir /mnt/cache
-          sudo mkdir /mnt/output
-          WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
-          sudo ln -sf /mnt/output "${GITHUB_WORKSPACE}/output"
-          sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
-          sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
+          # Remove GitHub-hosted runner bloat (no-op on self-hosted, safe to ignore errors)
+          sudo rm -rf /usr/local/lib/android/sdk/ndk 2>/dev/null || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          # Use RUNNER_TEMP for cache/output — works on Linux and macOS
+          mkdir -p "${RUNNER_TEMP}/cache"
+          mkdir -p "${RUNNER_TEMP}/output"
+          ln -sf "${RUNNER_TEMP}/output" "${GITHUB_WORKSPACE}/output"
           df -h
 
       - name: Restore compiler cache
         uses: actions/cache/restore@v4
         with:
-          path: /mnt/cache/cc
+          path: ${{ runner.temp }}/cache/cc
           key: baos-cc-${{ matrix.board.id }}
 
       - name: Log in to GitHub Container Registry
@@ -308,7 +307,7 @@ jobs:
       - name: Save compiler cache
         uses: actions/cache/save@v4
         with:
-          path: /mnt/cache/cc
+          path: ${{ runner.temp }}/cache/cc
           key: baos-cc-${{ matrix.board.id }}-${{ github.run_id }}
 
       - name: Upload OS image artifact
@@ -334,7 +333,7 @@ jobs:
   # -----------------------------------------------------------------------
   release:
     name: Publish BAOS ${{ needs.prepare.outputs.baos_version }}
-    runs-on: ubuntu-22.04
+    runs-on: self-hosted-baos-builder
     needs:
       - prepare
       - build
