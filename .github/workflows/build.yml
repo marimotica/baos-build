@@ -100,7 +100,7 @@ jobs:
       - name: Generate development version suffix
         id: version_dev
         run: |
-          version_dev="dev$(date --utc +'%Y%m%d')"
+          version_dev="dev$(date -u +'%Y%m%d')"
           echo "version_dev=${version_dev}" >> "$GITHUB_OUTPUT"
 
       - name: Set version suffix in checkout
