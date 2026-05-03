@@ -315,23 +315,33 @@ jobs:
         with:
           name: signing-key
 
-      - name: Free disk space and prepare mount points
+      - name: Set up Docker named volumes
+        env:
+          BOARD: ${{ matrix.board.id }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          df -h
-          # Remove GitHub-hosted runner bloat (no-op on self-hosted, safe to ignore errors)
-          rm -rf /usr/local/lib/android/sdk/ndk 2>/dev/null || true
-          rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
-          # Use RUNNER_TEMP for cache/output — works on Linux and macOS
-          mkdir -p "${RUNNER_TEMP}/cache"
-          mkdir -p "${RUNNER_TEMP}/output"
-          ln -sf "${RUNNER_TEMP}/output" "${GITHUB_WORKSPACE}/output"
-          df -h
+          # Named volumes live inside Docker Desktop's Linux VM — not on the macOS filesystem.
+          # This avoids case-insensitive FS issues and broken inode semantics that break glibc/Buildroot.
+          BUILD_VOL="baos-build-${BOARD}-${RUN_ID}"
+          OUTPUT_VOL="baos-output-${BOARD}-${RUN_ID}"
+          CACHE_VOL="baos-cache-${BOARD}"
 
-      - name: Restore compiler cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/cache/cc
-          key: baos-cc-${{ matrix.board.id }}
+          docker volume create "${BUILD_VOL}"
+          docker volume create "${OUTPUT_VOL}"
+          docker volume create "${CACHE_VOL}" 2>/dev/null || true  # may already exist from prior run
+
+          echo "BUILD_VOL=${BUILD_VOL}"   >> "$GITHUB_ENV"
+          echo "OUTPUT_VOL=${OUTPUT_VOL}" >> "$GITHUB_ENV"
+          echo "CACHE_VOL=${CACHE_VOL}"   >> "$GITHUB_ENV"
+
+      - name: Copy source tree into build volume
+        run: |
+          # Seed the build volume with the checked-out source
+          docker run --rm --platform linux/amd64 \
+            -v "${BUILD_VOL}:/build" \
+            -v "${GITHUB_WORKSPACE}:/src:ro" \
+            debian:bullseye-slim \
+            bash -c "cp -a /src/. /build/"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -345,33 +355,43 @@ jobs:
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: make ${{ matrix.board.defconfig }}_defconfig
+          build_volume: ${{ env.BUILD_VOL }}
+          output_volume: ${{ env.OUTPUT_VOL }}
+          cache_volume: ${{ env.CACHE_VOL }}
 
       - name: Build
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: make
+          build_volume: ${{ env.BUILD_VOL }}
+          output_volume: ${{ env.OUTPUT_VOL }}
+          cache_volume: ${{ env.CACHE_VOL }}
 
       - name: Check Linux config
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
-          command: |
-            make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
+          command: make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
+          build_volume: ${{ env.BUILD_VOL }}
+          output_volume: ${{ env.OUTPUT_VOL }}
+          cache_volume: ${{ env.CACHE_VOL }}
 
-      - name: Save compiler cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/cache/cc
-          key: baos-cc-${{ matrix.board.id }}-${{ github.run_id }}
+      - name: Extract images from output volume
+        run: |
+          mkdir -p "${RUNNER_TEMP}/images"
+          # Copy built images out of the Linux VM volume to the macOS host for upload
+          docker run --rm --platform linux/amd64 \
+            -v "${OUTPUT_VOL}:/output:ro" \
+            -v "${RUNNER_TEMP}/images:/out" \
+            debian:bullseye-slim \
+            bash -c "find /output/images -name 'baos_*.img.xz' -o -name 'baos_*.raucb' | xargs -I{} cp {} /out/ 2>/dev/null || true"
 
       - name: Upload OS image artifact
         uses: actions/upload-artifact@v4
         with:
           name: baos_${{ matrix.board.id }}-${{ needs.prepare.outputs.baos_version }}
-          path: |
-            output/images/baos_${{ matrix.board.id }}-*.img.xz
-            output/images/baos_${{ matrix.board.id }}-*.raucb
+          path: ${{ runner.temp }}/images/
           retention-days: 30
 
       - name: Build summary
@@ -379,9 +399,16 @@ jobs:
           echo "## ${{ matrix.board.id }} build summary" >> "$GITHUB_STEP_SUMMARY"
           echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-|:-|" >> "$GITHUB_STEP_SUMMARY"
-          for f in output/images/baos_*; do
-            echo "| $(basename $f) | $(du -bh $f | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+          for f in "${RUNNER_TEMP}"/images/baos_*; do
+            [ -f "$f" ] && echo "| $(basename $f) | $(du -sh $f | cut -f1) |" >> "$GITHUB_STEP_SUMMARY" || true
           done
+
+      - name: Clean up build volumes
+        if: always()
+        run: |
+          docker volume rm "${BUILD_VOL}"  2>/dev/null || true
+          docker volume rm "${OUTPUT_VOL}" 2>/dev/null || true
+          # Keep CACHE_VOL — it persists compiler cache across runs
 
   # -----------------------------------------------------------------------
   # 4. Publish GitHub Release
