@@ -22,6 +22,10 @@ on:
         description: "Boards to build: empty = rpi5-64+rpi4-64 (default), 'all' = all boards, or comma-separated IDs"
         required: false
         default: ""
+      channel:
+        description: "Update channel: stable, beta, or dev"
+        required: false
+        default: "stable"
       reason:
         description: "Reason for manual build"
         required: false
@@ -49,7 +53,9 @@ jobs:
     outputs:
       haos_version:          ${{ steps.versions.outputs.haos }}
       core_version:          ${{ steps.versions.outputs.core }}
+      supervisor_version:    ${{ steps.versions.outputs.supervisor }}
       baos_version:          ${{ steps.versions.outputs.baos }}
+      channel:               ${{ steps.versions.outputs.channel }}
       trigger_source:        ${{ steps.versions.outputs.trigger_source }}
       version_dev:           ${{ steps.version_dev.outputs.version_dev }}
       matrix:                ${{ steps.generate_matrix.outputs.result }}
@@ -75,9 +81,23 @@ jobs:
 
           HAOS=$(echo "$VERSIONS" | jq -r '.haos')
           CORE=$(echo "$VERSIONS" | jq -r '.core')
+          SUPERVISOR=$(echo "$VERSIONS" | jq -r '.supervisor')
 
-          # BAOS version = HAOS base + date-based dev suffix
-          BAOS="${HAOS}+baos.$(date -u +%Y%m%d%H%M)"
+          # BAOS version follows HA OS versioning exactly — no extra suffix
+          BAOS="${HAOS}"
+
+          # Determine update channel:
+          #   workflow_dispatch with channel input → honour it
+          #   upstream-update / baos-component-update dispatch → stable
+          #   push to main → dev
+          CHANNEL="${{ github.event.inputs.channel || '' }}"
+          if [ -z "${CHANNEL}" ]; then
+            if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+              CHANNEL="stable"
+            else
+              CHANNEL="dev"
+            fi
+          fi
 
           TRIGGER="${{ github.event_name }}"
           if [[ "$TRIGGER" == "repository_dispatch" ]]; then
@@ -86,32 +106,49 @@ jobs:
 
           echo "haos=${HAOS}"                  >> "$GITHUB_OUTPUT"
           echo "core=${CORE}"                  >> "$GITHUB_OUTPUT"
+          echo "supervisor=${SUPERVISOR}"      >> "$GITHUB_OUTPUT"
           echo "baos=${BAOS}"                  >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}"            >> "$GITHUB_OUTPUT"
           echo "trigger_source=${TRIGGER}"     >> "$GITHUB_OUTPUT"
 
           echo "### Build versions"            >> "$GITHUB_STEP_SUMMARY"
           echo "| Component | Version |"       >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|"                      >> "$GITHUB_STEP_SUMMARY"
-          echo "| HAOS base | ${HAOS} |"       >> "$GITHUB_STEP_SUMMARY"
-          echo "| HA Core   | ${CORE} |"       >> "$GITHUB_STEP_SUMMARY"
-          echo "| BAOS      | ${BAOS} |"       >> "$GITHUB_STEP_SUMMARY"
-          echo "| Triggered by | ${TRIGGER} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| HAOS base  | ${HAOS} |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "| HA Core    | ${CORE} |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "| Supervisor | ${SUPERVISOR} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| BAOS       | ${BAOS} |"       >> "$GITHUB_STEP_SUMMARY"
+          echo "| Channel    | ${CHANNEL} |"    >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | ${TRIGGER} |"  >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate development version suffix
         id: version_dev
         run: |
-          version_dev="dev$(date -u +'%Y%m%d')"
+          # Stable and beta releases use no suffix — version matches HAOS exactly.
+          # Dev builds get a date-based suffix so they don't collide with stable tags.
+          CHANNEL="${{ steps.versions.outputs.channel }}"
+          if [[ "${CHANNEL}" == "stable" || "${CHANNEL}" == "beta" ]]; then
+            version_dev=""
+          else
+            version_dev="dev$(date -u +'%Y%m%d')"
+          fi
           echo "version_dev=${version_dev}" >> "$GITHUB_OUTPUT"
 
       - name: Set version suffix in checkout
         env:
           VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
+          CHANNEL: ${{ steps.versions.outputs.channel }}
         run: |
           python3 -c "
           import re, os
           path = 'buildroot-external/meta'
           text = open(path).read()
-          text = re.sub(r'^(VERSION_SUFFIX=\").*(\")$', r'\g<1>' + os.environ['VERSION_DEV'] + r'\g<2>', text, flags=re.MULTILINE)
+          suffix = os.environ['VERSION_DEV']
+          text = re.sub(r'^(VERSION_SUFFIX=\").*(\")$', r'\g<1>' + suffix + r'\g<2>', text, flags=re.MULTILINE)
+          # Set DEPLOYMENT to match the channel
+          channel = os.environ['CHANNEL']
+          deployment = 'production' if channel in ('stable', 'beta') else 'development'
+          text = re.sub(r'^(DEPLOYMENT=\").*(\")$', r'\g<1>' + deployment + r'\g<2>', text, flags=re.MULTILINE)
           open(path, 'w').write(text)
           "
 
@@ -153,6 +190,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          platforms: linux/amd64
           tags: ghcr.io/${{ github.repository_owner }}/haos-builder
           cache-from: ghcr.io/${{ github.repository_owner }}/haos-builder:cache
           cache-to:   ghcr.io/${{ github.repository_owner }}/haos-builder:cache
@@ -248,12 +286,17 @@ jobs:
       - name: Set version suffix
         env:
           VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           python3 -c "
           import re, os
           path = 'buildroot-external/meta'
           text = open(path).read()
-          text = re.sub(r'^(VERSION_SUFFIX=\").*(\")$', r'\g<1>' + os.environ['VERSION_DEV'] + r'\g<2>', text, flags=re.MULTILINE)
+          suffix = os.environ['VERSION_DEV']
+          text = re.sub(r'^(VERSION_SUFFIX=\").*(\")$', r'\g<1>' + suffix + r'\g<2>', text, flags=re.MULTILINE)
+          channel = os.environ['CHANNEL']
+          deployment = 'production' if channel in ('stable', 'beta') else 'development'
+          text = re.sub(r'^(DEPLOYMENT=\").*(\")$', r'\g<1>' + deployment + r'\g<2>', text, flags=re.MULTILINE)
           open(path, 'w').write(text)
           "
 
@@ -370,14 +413,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name:   ${{ needs.prepare.outputs.baos_version }}
-          name:       "BAOS ${{ needs.prepare.outputs.baos_version }}"
+          name:       "Boat Assistant OS ${{ needs.prepare.outputs.baos_version }}"
           repository: ${{ env.BAOS_BUILD_REPO }}
           token:      ${{ secrets.BAOS_BUILD_TOKEN }}
+          prerelease: ${{ needs.prepare.outputs.channel == 'beta' || needs.prepare.outputs.channel == 'dev' }}
           body: |
             ## Boat Assistant OS ${{ needs.prepare.outputs.baos_version }}
 
-            Based on **Home Assistant OS ${{ needs.prepare.outputs.haos_version }}**
-            with HA Core ${{ needs.prepare.outputs.core_version }}.
+            | Component | Version |
+            |---|---|
+            | Operating System | ${{ needs.prepare.outputs.baos_version }} |
+            | Home Assistant Core | ${{ needs.prepare.outputs.core_version }} |
+            | Channel | ${{ needs.prepare.outputs.channel }} |
+
+            Based on **Home Assistant OS ${{ needs.prepare.outputs.haos_version }}**.
 
             ### Install via Raspberry Pi Imager
             Open RPi Imager, choose **Other specific-purpose OS → Home automation → Boat Assistant**,
@@ -397,3 +446,12 @@ jobs:
           version:      ${{ needs.prepare.outputs.baos_version }}
           release-date: ${{ steps.release_time.outputs.iso }}
           token:        ${{ secrets.BAOS_BUILD_TOKEN }}
+
+      - name: Update version server channel manifests
+        uses: "./.github/actions/bump-version-server"
+        with:
+          version:    ${{ needs.prepare.outputs.baos_version }}
+          channel:    ${{ needs.prepare.outputs.channel }}
+          core:       ${{ needs.prepare.outputs.core_version }}
+          supervisor: ${{ needs.prepare.outputs.supervisor_version }}
+          token:      ${{ secrets.BAOS_BUILD_TOKEN }}
