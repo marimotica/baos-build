@@ -139,18 +139,12 @@ jobs:
           VERSION_DEV: ${{ steps.version_dev.outputs.version_dev }}
           CHANNEL: ${{ steps.versions.outputs.channel }}
         run: |
-          python3 -c "
-          import re, os
-          path = 'buildroot-external/meta'
-          text = open(path).read()
-          suffix = os.environ['VERSION_DEV']
-          text = re.sub(r'^(VERSION_SUFFIX=\").*(\")$', r'\g<1>' + suffix + r'\g<2>', text, flags=re.MULTILINE)
-          # Set DEPLOYMENT to match the channel
-          channel = os.environ['CHANNEL']
-          deployment = 'production' if channel in ('stable', 'beta') else 'development'
-          text = re.sub(r'^(DEPLOYMENT=\").*(\")$', r'\g<1>' + deployment + r'\g<2>', text, flags=re.MULTILINE)
-          open(path, 'w').write(text)
-          "
+          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+          DEPLOYMENT="development"
+          if [[ "${CHANNEL}" == "stable" || "${CHANNEL}" == "beta" ]]; then
+            DEPLOYMENT="production"
+          fi
+          sed -i -E "s/(^DEPLOYMENT=\").*(\"$)/\1${DEPLOYMENT}\2/" buildroot-external/meta
 
       - name: Create build matrix
         uses: actions/github-script@v7
@@ -190,7 +184,6 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
           tags: ghcr.io/${{ github.repository_owner }}/haos-builder
           cache-from: ghcr.io/${{ github.repository_owner }}/haos-builder:cache
           cache-to:   ghcr.io/${{ github.repository_owner }}/haos-builder:cache
@@ -288,17 +281,12 @@ jobs:
           VERSION_DEV: ${{ needs.prepare.outputs.version_dev }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
-          python3 -c "
-          import re, os
-          path = 'buildroot-external/meta'
-          text = open(path).read()
-          suffix = os.environ['VERSION_DEV']
-          text = re.sub(r'^(VERSION_SUFFIX=\").*(\")$', r'\g<1>' + suffix + r'\g<2>', text, flags=re.MULTILINE)
-          channel = os.environ['CHANNEL']
-          deployment = 'production' if channel in ('stable', 'beta') else 'development'
-          text = re.sub(r'^(DEPLOYMENT=\").*(\")$', r'\g<1>' + deployment + r'\g<2>', text, flags=re.MULTILINE)
-          open(path, 'w').write(text)
-          "
+          sed -i -E "s/(^VERSION_SUFFIX=\").*(\"$)/\1${VERSION_DEV}\2/" buildroot-external/meta
+          DEPLOYMENT="development"
+          if [[ "${CHANNEL}" == "stable" || "${CHANNEL}" == "beta" ]]; then
+            DEPLOYMENT="production"
+          fi
+          sed -i -E "s/(^DEPLOYMENT=\").*(\"$)/\1${DEPLOYMENT}\2/" buildroot-external/meta
 
       - name: Add release PKI certs
         if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
@@ -315,33 +303,24 @@ jobs:
         with:
           name: signing-key
 
-      - name: Set up Docker named volumes
-        env:
-          BOARD: ${{ matrix.board.id }}
-          RUN_ID: ${{ github.run_id }}
+      - name: Free disk space and prepare mount points
         run: |
-          # Named volumes live inside Docker Desktop's Linux VM — not on the macOS filesystem.
-          # This avoids case-insensitive FS issues and broken inode semantics that break glibc/Buildroot.
-          BUILD_VOL="baos-build-${BOARD}-${RUN_ID}"
-          OUTPUT_VOL="baos-output-${BOARD}-${RUN_ID}"
-          CACHE_VOL="baos-cache-${BOARD}"
+          df -h
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/cache
+          sudo mkdir -p /mnt/output
+          WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
+          sudo ln -sf /mnt/output "${GITHUB_WORKSPACE}/output"
+          sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
+          sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
+          df -h
 
-          docker volume create "${BUILD_VOL}"
-          docker volume create "${OUTPUT_VOL}"
-          docker volume create "${CACHE_VOL}" 2>/dev/null || true  # may already exist from prior run
-
-          echo "BUILD_VOL=${BUILD_VOL}"   >> "$GITHUB_ENV"
-          echo "OUTPUT_VOL=${OUTPUT_VOL}" >> "$GITHUB_ENV"
-          echo "CACHE_VOL=${CACHE_VOL}"   >> "$GITHUB_ENV"
-
-      - name: Copy source tree into build volume
-        run: |
-          # Seed the build volume with the checked-out source
-          docker run --rm --platform linux/amd64 \
-            -v "${BUILD_VOL}:/build" \
-            -v "${GITHUB_WORKSPACE}:/src:ro" \
-            debian:bullseye-slim \
-            bash -c "cp -a /src/. /build/"
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /mnt/cache/cc
+          key: baos-cc-${{ matrix.board.id }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -355,43 +334,33 @@ jobs:
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: make ${{ matrix.board.defconfig }}_defconfig
-          build_volume: ${{ env.BUILD_VOL }}
-          output_volume: ${{ env.OUTPUT_VOL }}
-          cache_volume: ${{ env.CACHE_VOL }}
 
       - name: Build
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: make
-          build_volume: ${{ env.BUILD_VOL }}
-          output_volume: ${{ env.OUTPUT_VOL }}
-          cache_volume: ${{ env.CACHE_VOL }}
 
       - name: Check Linux config
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
-          command: make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
-          build_volume: ${{ env.BUILD_VOL }}
-          output_volume: ${{ env.OUTPUT_VOL }}
-          cache_volume: ${{ env.CACHE_VOL }}
+          command: |
+            make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
 
-      - name: Extract images from output volume
-        run: |
-          mkdir -p "${RUNNER_TEMP}/images"
-          # Copy built images out of the Linux VM volume to the macOS host for upload
-          docker run --rm --platform linux/amd64 \
-            -v "${OUTPUT_VOL}:/output:ro" \
-            -v "${RUNNER_TEMP}/images:/out" \
-            debian:bullseye-slim \
-            bash -c "find /output/images -name 'baos_*.img.xz' -o -name 'baos_*.raucb' | xargs -I{} cp {} /out/ 2>/dev/null || true"
+      - name: Save compiler cache
+        uses: actions/cache/save@v4
+        with:
+          path: /mnt/cache/cc
+          key: baos-cc-${{ matrix.board.id }}-${{ github.run_id }}
 
       - name: Upload OS image artifact
         uses: actions/upload-artifact@v4
         with:
           name: baos_${{ matrix.board.id }}-${{ needs.prepare.outputs.baos_version }}
-          path: ${{ runner.temp }}/images/
+          path: |
+            output/images/baos_${{ matrix.board.id }}-*.img.xz
+            output/images/baos_${{ matrix.board.id }}-*.raucb
           retention-days: 30
 
       - name: Build summary
@@ -399,16 +368,9 @@ jobs:
           echo "## ${{ matrix.board.id }} build summary" >> "$GITHUB_STEP_SUMMARY"
           echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
           echo "|:-|:-|" >> "$GITHUB_STEP_SUMMARY"
-          for f in "${RUNNER_TEMP}"/images/baos_*; do
-            [ -f "$f" ] && echo "| $(basename $f) | $(du -sh $f | cut -f1) |" >> "$GITHUB_STEP_SUMMARY" || true
+          for f in output/images/baos_*; do
+            echo "| $(basename $f) | $(du -bh $f | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
           done
-
-      - name: Clean up build volumes
-        if: always()
-        run: |
-          docker volume rm "${BUILD_VOL}"  2>/dev/null || true
-          docker volume rm "${OUTPUT_VOL}" 2>/dev/null || true
-          # Keep CACHE_VOL — it persists compiler cache across runs
 
   # -----------------------------------------------------------------------
   # 4. Publish GitHub Release
