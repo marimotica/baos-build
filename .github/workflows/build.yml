@@ -46,7 +46,7 @@ jobs:
   # -----------------------------------------------------------------------
   prepare:
     name: Prepare build
-    runs-on: self-hosted-baos-builder
+    runs-on: [self-hosted, baos-builder]
     permissions:
       contents: read
       packages: write
@@ -214,7 +214,7 @@ jobs:
   # -----------------------------------------------------------------------
   sync-os-fork:
     name: Sync ba-operating-system with upstream HAOS ${{ needs.prepare.outputs.haos_version }}
-    runs-on: self-hosted-baos-builder
+    runs-on: [self-hosted, baos-builder]
     needs: prepare
 
     steps:
@@ -256,7 +256,7 @@ jobs:
   # -----------------------------------------------------------------------
   build:
     name: Build for ${{ matrix.board.id }}
-    runs-on: self-hosted-baos-builder
+    runs-on: [self-hosted, baos-builder]
     permissions:
       contents: write
       packages: read
@@ -377,7 +377,7 @@ jobs:
   # -----------------------------------------------------------------------
   release:
     name: Publish BAOS ${{ needs.prepare.outputs.baos_version }}
-    runs-on: self-hosted-baos-builder
+    runs-on: [self-hosted, baos-builder]
     needs:
       - prepare
       - build
