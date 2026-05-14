@@ -308,6 +308,11 @@ jobs:
           df -h
           sudo rm -rf /usr/local/lib/android/sdk/ndk
           sudo rm -rf /opt/hostedtoolcache/CodeQL
+          # Always wipe /mnt/output between runs on self-hosted runners.
+          # Stale build trees cause Buildroot to skip prerequisite packages
+          # (e.g. host-glibc) while still trying to rebuild host-gcc-final,
+          # which then fails with "cannot find crti.o".
+          sudo rm -rf /mnt/output
           sudo mkdir -p /mnt/cache
           sudo mkdir -p /mnt/output
           WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
