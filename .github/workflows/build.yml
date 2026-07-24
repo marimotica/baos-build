@@ -288,6 +288,12 @@ jobs:
           fi
           sed -i -E "s/(^DEPLOYMENT=\").*(\"$)/\1${DEPLOYMENT}\2/" buildroot-external/meta
 
+      - name: Use upstream Home Assistant version manifest
+        run: |
+          sed -i 's#HASSIO_VERSION_URL = "https://version.boat-assistant.io/"#HASSIO_VERSION_URL = "https://raw.githubusercontent.com/home-assistant/version/master/"#' buildroot-external/package/hassio/hassio.mk
+          sed -i 's/HASSIO_VERSION_CHANNEL = "stable\.baos"/HASSIO_VERSION_CHANNEL = "stable"/' buildroot-external/package/hassio/hassio.mk
+          sed -i 's/HASSIO_VERSION_CHANNEL = "beta\.baos"/HASSIO_VERSION_CHANNEL = "beta"/' buildroot-external/package/hassio/hassio.mk
+
       - name: Add release PKI certs
         if: ${{ needs.prepare.outputs.self_signed_cert != 'true' }}
         env:
